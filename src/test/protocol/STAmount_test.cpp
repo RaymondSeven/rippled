@@ -5,6 +5,9 @@
 #include <xrpl/protocol/STAmount.h>
 #include <xrpl/protocol/XRPAmount.h>
 
+#include <array>
+#include <limits>
+
 namespace xrpl {
 
 class STAmount_test : public beast::unit_test::suite
@@ -1185,6 +1188,111 @@ public:
 
     //--------------------------------------------------------------------------
 
+    // The MPT branch of STAmount(SerialIter&, SField const&) decodes the
+    // 9-byte amount header and 24-byte MPTID directly into mValue / mAsset
+    // and returns WITHOUT calling canonicalize() or any range / canonical
+    // checks. Compare:
+    //   - XRP path: explicitly throws on "negative zero is not canonical".
+    //   - IOU path: invokes canonicalize() which validates ranges and
+    //     normalizes mIsNegative when mValue == 0.
+    //   - MPT path: neither.
+    // This means a SerialIter feeding STAmount can produce two non-canonical
+    // amounts that should have been rejected at parse time:
+    //   (a) mValue > maxMPTokenAmount (i.e. high bit of value set, so the
+    //       int64 cast in STAmount::mpt() reinterprets as a negative
+    //       MPTAmount value).
+    //   (b) negative-zero MPT (mValue == 0, mIsNegative == true).
+    // Both should throw. Today, the SerialIter ctor accepts both. These
+    // BEAST_EXPECT's flag the missing checks in CI.
+    void
+    testMPTSerialIterCanonicalChecks()
+    {
+        testcase("MPT SerialIter canonical checks");
+
+        auto const buildBlob = [](std::uint8_t flagByte,
+                                  std::uint64_t mValueBits) -> Serializer {
+            Serializer s;
+            s.add8(flagByte);
+            s.add64(mValueBits);
+            // 24-byte MPTID payload — content does not matter for the
+            // SerialIter ctor's range / canonical checks.
+            std::array<std::uint8_t, 24> mptId{};
+            for (std::size_t i = 0; i < mptId.size(); ++i)
+                mptId[i] = static_cast<std::uint8_t>(i + 1);
+            s.addRaw(mptId.data(), mptId.size());
+            return s;
+        };
+
+        // (a) Positive MPT with mValue = UINT64_MAX (> maxMPTokenAmount).
+        //     The encoder STAmount::add() never produces this: canonicalize()
+        //     throws if mValue > maxMPTokenAmount before encoding. The
+        //     decoder must reject it symmetrically. flag = cMPToken|cPositive
+        //     >> 56 == 0x60.
+        {
+            auto const ser =
+                buildBlob(0x60, std::numeric_limits<std::uint64_t>::max());
+            SerialIter sit(ser.slice());
+            bool threw = false;
+            try
+            {
+                STAmount const amt(sit, sfGeneric);
+                // If we reach here, the broken SerialIter ctor accepted a
+                // wire-format MPT amount whose mantissa exceeds
+                // maxMPTokenAmount. The downstream call STAmount::mpt()
+                // performs static_cast<int64_t>(mValue), so this UINT64_MAX
+                // value reinterprets as -1 — a state the rest of the ledger
+                // (accountSendMPT, isMPTOverflow, MPToken balance updates)
+                // is not prepared to handle.
+            }
+            catch (std::runtime_error const&)
+            {
+                threw = true;
+            }
+            BEAST_EXPECT(threw);
+        }
+
+        // (b) Negative MPT with mValue = 0 (negative zero).
+        //     The XRP branch explicitly rejects this with
+        //     "negative zero is not canonical". The MPT branch does not.
+        //     flag = cMPToken >> 56 == 0x20.
+        {
+            auto const ser = buildBlob(0x20, 0u);
+            SerialIter sit(ser.slice());
+            bool threw = false;
+            try
+            {
+                STAmount const amt(sit, sfGeneric);
+            }
+            catch (std::runtime_error const&)
+            {
+                threw = true;
+            }
+            BEAST_EXPECT(threw);
+        }
+
+        // (c) Round-trip canonical MPT (sanity): a legitimate value should
+        //     still parse without throwing. flag = 0x60, mValue = 1.
+        {
+            auto const ser = buildBlob(0x60, 1u);
+            SerialIter sit(ser.slice());
+            bool threw = false;
+            try
+            {
+                STAmount const amt(sit, sfGeneric);
+                BEAST_EXPECT(amt.holds<MPTIssue>());
+                BEAST_EXPECT(amt.mantissa() == 1);
+                BEAST_EXPECT(!amt.negative());
+            }
+            catch (std::exception const&)
+            {
+                threw = true;
+            }
+            BEAST_EXPECT(!threw);
+        }
+    }
+
+    //--------------------------------------------------------------------------
+
     void
     run() override
     {
@@ -1203,6 +1311,7 @@ public:
         testCanSubtractXRP();
         testCanSubtractIOU();
         testCanSubtractMPT();
+        testMPTSerialIterCanonicalChecks();
     }
 };
 
